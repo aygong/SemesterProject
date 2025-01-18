@@ -147,14 +147,12 @@ class Encoder(nn.Module):
         return x
 
 
-class Transformer(nn.Module):
+class NodeEncoder(nn.Module):
     def __init__(self,
                  device,
-                 num_vehicles,
-                 input_seq_len,
-                 target_seq_len,
+                 input_seq_len=10,
                  d_model=512,
-                 num_layers=6,
+                 num_layers=2,
                  num_heads=8,
                  d_k=64,
                  d_v=64,
@@ -163,33 +161,21 @@ class Transformer(nn.Module):
         super().__init__()
 
         self.device = device
-        self.num_vehicles = num_vehicles
 
         # User encoder.
+        self.embed_type = nn.Linear(5, d_model)
         self.linear_window = nn.Linear(2, d_model)
-        self.linear_coords = nn.Linear(2, d_model)
-        self.linear_duration = nn.Linear(1, d_model)
+        self.linear_servicetime = nn.Linear(1, d_model)
+        self.linear_ridetime = nn.Linear(1, d_model)
+        self.linear_load = nn.Linear(1, d_model)
+        self.embed_vehiclepres = nn.Embedding(2, d_model)
+        self.linear_capacity = nn.Linear(1, d_model)
+        self.linear_nextavailable = nn.Linear(1, d_model)
+        self.linear_routedur = nn.Linear(1, d_model)
+        self.embed_isnext = nn.Embedding(2, d_model)
 
-        self.embed_alpha = nn.Embedding(3, d_model)
-        self.embed_beta = nn.Embedding(3, d_model)
-        self.embed_served = nn.Embedding(num_vehicles + 1, d_model)
-        self.embed_serving = nn.Embedding(num_vehicles, d_model)
 
-        self.user_encoder = Encoder(
-            input_seq_len=9 + num_vehicles,
-            num_layers=2,
-            d_model=d_model,
-            num_heads=num_heads,
-            d_k=d_k,
-            d_v=d_v,
-            d_ff=d_ff,
-            dropout=dropout
-        )
-
-        self.user_linear = nn.Linear((9 + num_vehicles) * d_model, d_model)
-
-        # Encoder.
-        self.encoder = Encoder(
+        self.node_encoder = Encoder(
             input_seq_len=input_seq_len,
             num_layers=num_layers,
             d_model=d_model,
@@ -200,57 +186,32 @@ class Transformer(nn.Module):
             dropout=dropout
         )
 
-        # Linear for policy.
-        # self.policy = nn.Linear(input_seq_len * d_model, target_seq_len)
-        self.policy = nn.Sequential(
-            nn.Linear(input_seq_len * d_model, d_ff), 
-            nn.ReLU(),
-            nn.Linear(d_ff, target_seq_len) 
-        )
+        self.node_linear = nn.Linear(10 * d_model, d_model)
 
-        # Linear for cost-to-go.
-        self.value = nn.Sequential(
-            nn.Linear(input_seq_len * d_model, d_ff), 
-            nn.ReLU(),
-            nn.Linear(d_ff, 1) 
-        )
 
     # noinspection PyListCreation
-    def forward(self, states, user_mask=None, src_mask=None):
+    def forward(self, nodes, user_mask=None, src_mask=None):
+        
         # Embedding.
-        x = []
-        for _, user_info in enumerate(states):
-            user_seq = []
+        nodes = nodes.to(self.device)
+        node_seq = []
+        node_seq.append(self.embed_type(nodes[:,:5]))
+        node_seq.append(self.linear_window(nodes[:,5:7]))
+        node_seq.append(self.linear_ridetime(nodes[:,7:8])) # slice of 1 element to keep dimensions of size 1 in tensor
+        node_seq.append(self.linear_ridetime(nodes[:,8:9]))
+        node_seq.append(self.linear_load(nodes[:,9:10]))
+        node_seq.append(self.embed_vehiclepres(nodes[:,10].long()))
+        node_seq.append(self.linear_capacity(nodes[:,11:12]))
+        node_seq.append(self.linear_nextavailable(nodes[:,12:13]))
+        node_seq.append(self.linear_routedur(nodes[:,13:14]))
+        node_seq.append(self.embed_isnext(nodes[:,14].long()))
 
-            # Shape: (batch_size, 2) -> Shape: (batch_size, d_model)
-            user_seq.append(self.linear_coords(user_info[0].to(self.device)))
-            user_seq.append(self.linear_coords(user_info[1].to(self.device)))
+        #for n in node_seq:
+        #    print(n.size())
 
-            user_seq.append(self.linear_window(user_info[2].to(self.device)))
-            user_seq.append(self.linear_window(user_info[3].to(self.device)))
+        x = torch.stack(node_seq, dim=1)
+        x = self.node_encoder(x)
+        #print(x.flatten(start_dim=2).size())
+        x = self.node_linear(x.flatten(start_dim=1))
 
-            # Shape: (batch_size, 1) -> Shape: (batch_size, d_model)
-            user_seq.append(self.linear_duration(user_info[4].unsqueeze(-1).to(self.device)))
-
-            user_seq.append(self.embed_alpha(user_info[5].long().to(self.device)))
-            user_seq.append(self.embed_beta(user_info[6].long().to(self.device)))
-
-            user_seq.append(self.embed_served(user_info[7].long().to(self.device)))
-            user_seq.append(self.embed_serving(user_info[8].long().to(self.device)))
-
-            for k in range(1, self.num_vehicles + 1):
-                user_seq.append(self.linear_duration(user_info[8 + k].unsqueeze(-1).to(self.device)))
-
-            x.append(torch.stack(user_seq).permute(1, 0, 2))
-
-        x = torch.stack(x, dim=1)
-        x = self.user_encoder(x, src_mask=user_mask)
-        x = self.user_linear(x.flatten(start_dim=2))
-        # Encoder.
-        x = self.encoder(x, src_mask=src_mask)  # Shape: (batch_size, input_seq_len, d_model).
-
-        # Linear.
-        policy_output = self.policy(x.flatten(start_dim=1))  # Shape: (batch_size, target_seq_len).
-        value_output = torch.squeeze(self.value(x.flatten(start_dim=1))) # Shape: (batch_size, 1).
-
-        return policy_output, value_output
+        return x
