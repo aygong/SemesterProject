@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
 import dgl
 from node_encoder import NodeEncoder
 
@@ -32,15 +33,16 @@ class GraphTransformerNet(nn.Module):
                  ):
         
         super().__init__()
-
+        
         self.num_nodes = num_nodes
         self.layer_norm = layer_norm
         self.batch_norm = batch_norm
         self.device = device
         self.lap_pos_enc = lap_pos_enc
         self.residual = residual
+        #self.rope = RotaryEmbedding(dim=d_model)
         self.pe_dim = pe_dim
-        
+
         if self.lap_pos_enc:
             raise NotImplementedError()
         
@@ -79,7 +81,17 @@ class GraphTransformerNet(nn.Module):
         # input embedding
         #h = self.node_encoder(h) # To set to try more complex node encoder
         h = self.embedding_h(h)
+        ##################################
+        # Ensure inputs are on the GPU
+        h = h.to(self.device)
+        e = e.to(self.device)
+        vehicle_node_id = vehicle_node_id.to(self.device)
+        if h_lap_pe is not None:
+            h_lap_pe = h_lap_pe.to(self.device)
+        ##################################
 
+        #h = self.rope.rotate_queries_or_keys(h)
+        
         if self.pe_dim > 0 and h_lap_pe:
             h_lap_pe = self.embedding_lap_pe(h_lap_pe.float())
             h = h + h_lap_pe

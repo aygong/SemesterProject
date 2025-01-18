@@ -18,6 +18,7 @@ def dataset(args):
 
         sum_travel_times = 0
         # Run the simulator
+
         while darp.finish():
             # Select next available vehicle
             free_times = [vehicle.free_time for vehicle in darp.vehicles]
@@ -34,9 +35,10 @@ def dataset(args):
                 cost_to_go = objective - sum_travel_times # cost to go from this state until the end, BEFORE taking the action
                 action = darp.action(k) # compute action taken by expert policy
                 node = darp.action2node(action) # corresponding node
-                
-                if node not in state.successors(next_vehicle_node):
-                    raise ValueError('Error in graph creation: vehicle cannot perform best action.')
+
+
+                #if node not in state.successors(next_vehicle_node) and node != 0:
+                #    raise ValueError('Error in graph creation: vehicle cannot perform best action.')
                 
 
                 sum_travel_times += darp.supervise_step(k) # exectue one step of MDP

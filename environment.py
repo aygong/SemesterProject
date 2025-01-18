@@ -8,12 +8,8 @@ from torch.utils.data import DataLoader
 import torch.nn.functional as f
 
 import dgl
-
 class Node:
-    # This class is only used to compute the arc elimination function at the beginning of a DARP instance
     def __init__(self):
-        super(Node, self).__init__()
-
         self.coords = [0.0, 0.0]
         self.serve_duration = 0
         self.load = 0
@@ -21,8 +17,6 @@ class Node:
 
 class User:
     def __init__(self, mode):
-        super(User, self).__init__()
-
         self.id = 0
         self.pickup_coords = [0.0, 0.0]
         self.dropoff_coords = [0.0, 0.0]
@@ -31,27 +25,17 @@ class User:
         self.pickup_window = [0, 0]
         self.dropoff_window = [0, 0]
         self.ride_time = 0.0
-        # alpha: status taking values in {0, 1, 2}
-        # 0: the user is waiting to be served
-        # 1: the user is being served by a vehicle
-        # 2: the user has been served
+        # alpha: 0->waiting, 1->in vehicle, 2->finished
         self.alpha = 0
-        # beta: status taking values in {0, 1, 2}
-        # 0: the user is waiting to be served
-        # 1: the user is being served by the vehicle performing an action at time step t
-        # 2: the user cannot be served by the vehicle
+        # beta:  0->waiting, 1->can be served by current vehicle, 2->cannot be served
         self.beta = 0
-        # Identity of the vehicle which is serving the user
+        # Which vehicle is serving
         self.served = 0
-
         if mode != 'supervise':
             self.pred_served = []
 
-
 class Vehicle:
     def __init__(self, mode):
-        super(Vehicle, self).__init__()
-
         self.id = 0
         self.route = []
         self.schedule = []
@@ -61,7 +45,6 @@ class Vehicle:
         self.free_capacity = 0
         self.free_time = 0.0
         self.serve_duration = 0
-
         if mode != 'supervise':
             self.pred_route = [0]
             self.pred_schedule = [0]
@@ -125,20 +108,9 @@ class Darp:
             self.indices = []  # for beam search
             self.time = 0.0
 
+        self.graph_initialized = False
         self.num_nodes = 2*self.train_N + self.train_K + 2
 
-    #def load_from_file(self, num_instance=None):
-    #    """ Load the instances from the file, in beam search we load the instances one by one """
-    #    if num_instance:
-    #            instance = self.list_instances[num_instance]
-    #            self.list_instances.append(instance)
-    #    else:
-    #        for n in range (num_instance): 
-    #            data_path = './instance/' + self.train_name + '-train-'+ n + '.txt'
-    #            print('Loading instance from: ', data_path)
-    #            with open(data_path, 'r') as file:
-    #                for instance in file:
-    #                    self.list_instances.append(json.loads(instance))
     def load_from_file(self, num_instance=None):
         """ Load the instances from the file, in beam search we load the instances one by one """
         if num_instance:
@@ -148,17 +120,20 @@ class Darp:
             with open(self.data_path, 'r') as file:
                 for instance in file:
                     self.list_instances.append(json.loads(instance))
+
+
     def reset(self, num_instance):
         K, N, T, Q, L = self.parameter()
         instance = self.list_instances[num_instance]
 
+        # 1) Re-initialize users
         self.users = []
         for i in range(1, N + 1):
             user = User(mode=self.mode)
             user.id = i
             user.served = self.train_K
             self.users.append(user)
-        # Add dummy users if necessary
+        # Add dummy users
         for i in range(N+1, self.train_N+1):
             user = User(mode=self.mode)
             user.id = i
@@ -167,73 +142,80 @@ class Darp:
             user.served = self.train_K
             self.users.append(user)
 
-        for i in range(1, 2 * N + 1):
-            node = instance['instance'][i + 1]  # noqa
-            if i > N:
-                # shift to avoid dummy users
-                if N < self.train_N:
-                    i += self.train_N - N
-            user = self.users[self.node2user[i] - 1]
+        # 2) Fill in pickup/dropoff coords, windows
+        for i in range(1, 2*N + 1):
+            node = instance['instance'][i+1]  # i+1 => skip the depot line in the instance file
+            # If i> N => dropoff
+            # else => pickup
+            # Adjust indexing if needed
+            if i > N and N < self.train_N:
+                i_adj = i + (self.train_N - N)
+            else:
+                i_adj = i
+            
+            user_id = i_adj if i_adj <= N else (i_adj - N)
+            user = self.users[user_id - 1]
 
             if i <= N:
-                # Pick-up nodes
+                # pickup
                 user.pickup_coords = [float(node[1]), float(node[2])]
                 user.serve_duration = node[3]
                 user.load = node[4]
                 user.pickup_window = [float(node[5]), float(node[6])]
             else:
-                # Drop-off nodes
+                # dropoff
                 user.dropoff_coords = [float(node[1]), float(node[2])]
                 user.dropoff_window = [float(node[5]), float(node[6])]
 
-        # Time-window tightening (Section 5.1.1, Cordeau 2006)
+        # 3) Time-window tightening
         for user in self.users:
             if user.id > N:
-                # Dummy users
                 continue
             travel_time = euclidean_distance(user.pickup_coords, user.dropoff_coords)
-            if user.id <= N / 2:
-                # Drop-off requests
-                user.pickup_window[0] = \
-                    round(max(0.0, user.dropoff_window[0] - L - user.serve_duration), 3)
-                user.pickup_window[1] = \
-                    round(min(user.dropoff_window[1] - travel_time - user.serve_duration, T), 3)
+            # If user.id <= N/2 => drop-off requests? (This logic depends on how you label them.)
+            # Or if your data is random, adapt as needed.
+            if user.id <= (N/2):
+                user.pickup_window[0] = round(max(0.0, user.dropoff_window[0] - L - user.serve_duration),3)
+                user.pickup_window[1] = round(min(user.dropoff_window[1] - travel_time - user.serve_duration, T),3)
             else:
-                # Pick-up requests
-                user.dropoff_window[0] = \
-                    round(max(0.0, user.pickup_window[0] + user.serve_duration + travel_time), 3)
-                user.dropoff_window[1] = \
-                    round(min(user.pickup_window[1] + user.serve_duration + L, T), 3)
+                user.dropoff_window[0] = round(max(0.0, user.pickup_window[0] + user.serve_duration + travel_time),3)
+                user.dropoff_window[1] = round(min(user.pickup_window[1] + user.serve_duration + L, T),3)
 
+        # 4) Vehicles
         self.vehicles = []
-        for k in range(0, K):
-            vehicle = Vehicle(mode=self.mode)
-            vehicle.id = k
-            vehicle.route = instance['routes'][k]  # noqa
-            vehicle.route.insert(0, 0)
-            vehicle.route.append(2 * self.train_N + 1)
-            vehicle.schedule = instance['schedule'][k]  # noqa
-            vehicle.free_capacity = Q
-            self.vehicles.append(vehicle)
-        # Add dummy vehicles
+        for k in range(K):
+            v = Vehicle(mode=self.mode)
+            v.id = k
+            v.route = instance['routes'][k]
+            v.route.insert(0, 0)
+            v.route.append(2*self.train_N + 1)
+            v.schedule = instance['schedule'][k]
+            v.free_capacity = Q
+            self.vehicles.append(v)
         for k in range(K, self.train_K):
-            vehicle = Vehicle(mode=self.mode)
-            vehicle.id = k
-            vehicle.free_time = 1440
-            self.vehicles.append(vehicle)
+            v = Vehicle(mode=self.mode)
+            v.id = k
+            v.free_time = 1440
+            self.vehicles.append(v)
 
         if self.mode != 'supervise':
-            # Reinitialize the lists of metrics
             self.break_window = []
             self.break_ride_time = []
             self.break_same = []
             self.break_done = []
             self.time_penalty = 0
 
-        # Create the arcs dictionary
-        self.arc_elimination(display=False)
+        # 5) Arc elimination (build self.arcs dict)
+        self.arc_elimination(display=True)
 
-        return instance['objective']  # noqa
+        # 6) Initialize or re-initialize the graph
+        if not self.graph_initialized:
+            self.init_graph()   # Build the base structure, nodes, edges
+            self.graph_initialized = True
+        # We always do a full re-check of edges so they match the brand-new instance state
+        self.update_edge_feasibility()
+
+        return instance['objective']
     
     def arc_elimination(self, display=False):
         """
@@ -255,7 +237,6 @@ class Darp:
         # Do not perform arc elimination if not requested
         if not self.args.arc_elimination:
             return
-        
 
         # Pick-up sources
         for i in range(N):
@@ -368,7 +349,6 @@ class Darp:
             entries = [num_remaining_arcs[0]] + num_eliminated_arcs[1:] + [num_remaining_arcs[-1]]
             print("&", entries[0], "&", entries[1], "&", entries[2], "&", entries[3], "&", entries[4], "&", entries[5])
 
-
     def is_arc_feasible(self, i_u, i_v):
         """
         i_u and i_v are indices of nodes as in the state graph.
@@ -392,7 +372,6 @@ class Darp:
         return self.arcs[(converted_i_u, converted_i_v)]
         
 
-
     def beta(self, k):
         for i in range(0, self.train_N):
             user = self.users[i]
@@ -411,166 +390,297 @@ class Darp:
                     # 2: the user has been served
                     user.beta = 2
     
-    def vehicle_present(self, u_coords):
-        """Find whether a vehicle is present on u_coords, and return it."""
-        for k in self.vehicles:
-            if k.coords == u_coords:
-                # Must verify that there is not twice the same coordinates for two different users
-                return k
-        return None
+
+
+    ########################################################################
+    #                   Graph Construction (single graph)                  #
+    ########################################################################
+
+    def init_graph(self):
+        """
+        Build a single DGL graph with all possible nodes & edges, store in self.graph.
+        We'll store node info in self.node_info so we can do is_edge checks each step.
+        """
+        K, N = self.train_K, self.train_N
+        n_nodes = 2*N + K + 2  # 0..(2N+K+1)
+        n_features = 17
+        self.node_features = torch.zeros(n_nodes, n_features, device=self.device)
+
+        # Build node_info
+        self.node_info = []
+        # Node 0 -> wait
+        self.node_info.append({
+            'index': 0, 'type': 'wait',
+            'user': None, 'vehicle': None
+        })
+        # Pickup nodes -> 1..N
+        for i in range(1, N+1):
+            self.node_info.append({
+                'index': i,
+                'type': 'pickup',
+                'user': self.users[i-1],
+                'vehicle': None
+            })
+        # Dropoff nodes -> N+1..2N
+        for i in range(1, N+1):
+            self.node_info.append({
+                'index': N+i,
+                'type': 'dropoff',
+                'user': self.users[i-1],
+                'vehicle': None
+            })
+        # Destination -> 2N+1
+        self.node_info.append({
+            'index': 2*N+1,
+            'type': 'destination',
+            'user': None,
+            'vehicle': None
+        })
+        # Source nodes -> 2N+2..2N+K+1
+        for k_i in range(K):
+            self.node_info.append({
+                'index': 2*N+2 + k_i,
+                'type': 'source',
+                'user': None,
+                'vehicle': self.vehicles[k_i]
+            })
+
+        # Create graph
+        g = dgl.graph(([],[]), num_nodes=n_nodes, device=self.device)
+        g.ndata['feat'] = self.node_features
+
+        # Add edges for all possible pairs (i_u != i_v). We'll filter feasibility in edge features.
+        edges_src = []
+        edges_dst = []
+        edges_feat = []  # shape (#edges, 5) e.g. [dist, pairing, waiting, feasible, reverse_feasible]
+
+        for u_info in self.node_info:
+            for v_info in self.node_info:
+                if u_info['index']!=v_info['index']:
+                    edges_src.append(u_info['index'])
+                    edges_dst.append(v_info['index'])
+                    edges_feat.append([0.0, 0, 0, 1, 1])  # placeholder
+
+        g.add_edges(edges_src, edges_dst)
+        g.edata['feat'] = torch.tensor(edges_feat, device=self.device)
+        self.graph = g
+
+    def update_edge_feasibility(self):
+        """
+        Re-check is_edge(...) for every edge. Also update the edge feats: dist, pairing, waiting, feasible bits.
+        """
+
+        edges_src, edges_dst = self.graph.edges()
+        edges_feat = self.graph.edata['feat']  # shape (#E, 5)
+        # We'll define them as: 
+        #   0 -> distance
+        #   1 -> pairing
+        #   2 -> waiting
+        #   3 -> feasible
+        #   4 -> reverse_feasible
+
+        for e_id in range(self.graph.num_edges()):
+            i_u = edges_src[e_id].item()
+            i_v = edges_dst[e_id].item()
+
+            u_info = self.node_info[i_u]
+            v_info = self.node_info[i_v]
+
+            # fetch user or vehicle
+            u_user = u_info['user']
+            v_user = v_info['user']
+            k_u = u_info['vehicle']
+            k_v = v_info['vehicle']
+            t_u = u_info['type']
+            t_v = v_info['type']
+
+            # next vehicle logic if needed:
+            u_next = False
+            v_next = False
+            # (optionally set these if you need them)
+
+            # Distance
+            dist = 0.0
+            # For demonstration, let’s do a simple approach:
+            if u_user and (t_u=='pickup'):
+                start_coord = u_user.pickup_coords
+            elif u_user and (t_u=='dropoff'):
+                start_coord = u_user.dropoff_coords
+            elif k_u:
+                start_coord = k_u.coords
+            else:
+                start_coord = [0.0, 0.0]
+
+            if v_user and (t_v=='pickup'):
+                end_coord = v_user.pickup_coords
+            elif v_user and (t_v=='dropoff'):
+                end_coord = v_user.dropoff_coords
+            elif k_v:
+                end_coord = k_v.coords
+            else:
+                end_coord = [0.0, 0.0]
+
+            dist = euclidean_distance(start_coord, end_coord)
+
+            # Pairing = 1 if same user, else 0
+            pairing = 1 if (u_user and v_user and u_user is v_user) else 0
+
+            # waiting = 1 if either is wait
+            waiting = 1 if (t_u=='wait' or t_v=='wait') else 0
+
+            feasible = 1 if is_edge(self, i_u, u_user, k_u, t_u, u_next,
+                                          i_v, v_user, k_v, t_v, v_next) else 0
+            reverse_feasible = 1 if is_edge(self, i_v, v_user, k_v, t_v, v_next,
+                                                 i_u, u_user, k_u, t_u, u_next) else 0
+
+            edges_feat[e_id, 0] = dist
+            edges_feat[e_id, 1] = pairing
+            edges_feat[e_id, 2] = waiting
+            edges_feat[e_id, 3] = feasible
+            edges_feat[e_id, 4] = reverse_feasible
+
+        self.graph.edata['feat'] = edges_feat
+
+
+
+
+
+    ########################################################################
+    #                   state_graph() for backward compat                  #
+    ########################################################################
 
     def state_graph(self, k, current_time):
         """
-        Construct a graph of the situation
-        Nodes: 
-        - 2 per user (pickup + dropoff)
-        - K source stations (1 per vehicle) 
-        - 1 destination station
-        - 1 for the waiting action
-        - total = 2N+K+2.
-        Edges:
-        - each vehicle is connected to available user locations and destination station if the vehicle is empty.
-        - destination is connected to drop-off locations.
-        - already visited nodes are not connected to anything.
-        - the rest of the locations (users) are connected all together.
+        For old code that calls `state_graph(k, time)`,
+        we return (graph, next_vehicle_node).
+
+        We will:
+          1) Update node features for the current time/vehicle k
+          2) update_edge_feasibility()
+          3) Find next_vehicle_node (like old code).
+          4) Return (self.graph, next_vehicle_node).
         """
-        _, _, T, _, L = self.parameter()
-        K, N = self.train_K, self.train_N
-        n_nodes = 2*N + K + 2
-        n_features = 17
-        node_features = torch.zeros(n_nodes, n_features) # input features of each node
-        node_info = [] # node info to draw edges: node number, user (if any), vehicle (if any), type (pickup, dropoff, wait, source, destination), is_next_available (True or False), coords
-        next_vehicle_node = -1 # node conatining the vehicle that will perform an action
+        # 1) update node features (like old code: pickups, dropoffs, wait node, source node)
+        self.update_node_features(k, current_time)
+        # 2) update edges
+        self.update_edge_feasibility()
+        # 3) find which node is “next_vehicle_node”
+        next_vehicle_node = self.find_vehicle_node(k)
 
-        for u in self.users:
-            # pickup node
-            window = shift_window(u.pickup_window, current_time)
-            node_features[u.id, one_hot_node_type('pickup')] = 1    # Type of node (pickup, dropoff, wait, source, destination)
-            node_features[u.id, 5] = u.pickup_coords[0]             # x coord
-            node_features[u.id, 6] = u.pickup_coords[1]             # y coord
-            node_features[u.id, 7] = window[0]                      # start of window
-            node_features[u.id, 8] = window[1]                      # end of window
-            node_features[u.id, 9] = u.serve_duration               # service time
-            node_features[u.id, 10] = L - u.ride_time               # remaining ride time
-            node_features[u.id, 11] = u.load                        # user load
-            k_pres = self.vehicle_present(u.pickup_coords)          # check whether the is a vehicle on that node
-            if k_pres:
-                node_features[u.id, 12] = 1                         # vehicle present
-                node_features[u.id, 13] = k_pres.free_capacity      # free capacity
-                node_features[u.id, 14] = k_pres.free_time          # next available time
-                node_features[u.id, 15] = T                         # Remaining route duration ??? TO CHANGE
-                if k == k_pres.id:
-                    node_features[u.id, 16] = 1                     # is next available
-                    next_vehicle_node = u.id
-            
-            if (u.alpha == 0 or k_pres): # if not already visited
-                node_info.append((u.id, u, k_pres, 'pickup', (k_pres and k_pres.id==k), u.pickup_coords))
+        # 4) return
+        return self.graph, next_vehicle_node
 
-            # dropoff node
-            window = shift_window(u.dropoff_window, current_time)
-            node_features[u.id+N, one_hot_node_type('dropoff')] = 1   # Type of node (pickup, dropoff, wait, source, destination)
-            node_features[u.id+N, 5] = u.dropoff_coords[0]            # x coord
-            node_features[u.id+N, 6] = u.dropoff_coords[1]            # y coord
-            node_features[u.id+N, 7] = window[0]                      # start of window
-            node_features[u.id+N, 8] = window[1]                      # end of window
-            node_features[u.id+N, 9] = u.serve_duration               # service time
-            node_features[u.id+N, 10] = L - u.ride_time               # remaining ride time
-            node_features[u.id+N, 11] = -u.load                       # - user load
-            k_pres = self.vehicle_present(u.dropoff_coords)           # check whether the is a vehicle on that node
-            if k_pres:
-                node_features[u.id+N, 12] = 1                         # vehicle present
-                node_features[u.id+N, 13] = k_pres.free_capacity      # free capacity
-                node_features[u.id+N, 14] = k_pres.free_time          # next available time
-                node_features[u.id+N, 15] = T                         # Remaining route duration ??? TO CHANGE
-                if k == k_pres.id:
-                    node_features[u.id+N, 16] = 1                     # is next available
-                    next_vehicle_node = u.id+N
+    def update_node_features(self, k, current_time):
+        """
+        Re-zero self.node_features. Then fill in features for each node
+        (pickup, dropoff, wait, source, destination).
+        You can replicate your old approach if needed.
+        """
+        node_features = self.graph.ndata['feat']
+        node_features.zero_()
 
-            if (u.alpha <= 1 or k_pres): # if not already visited
-                node_info.append((u.id+N, u, k_pres, 'dropoff', (k_pres and k_pres.id==k), u.dropoff_coords))
+        K, N, T, Q, L = self.parameter()
 
-        # Destination node
-        node_features[2*N + 1, one_hot_node_type('destination')] = 1
-        node_info.append((2*N+1, None, None, 'destination', False, [0.0, 0.0]))
+        # Example logic: loop over self.node_info
+        for info in self.node_info:
+            i_nd = info['index']
+            t_nd = info['type']
+            v_user = info['user']
+            v_veh = info['vehicle']
 
-        # Waiting node
-        node_features[0, one_hot_node_type('wait')] = 1
-        node_features[0, 5] = self.vehicles[k].coords[0]
-        node_features[0, 6] = self.vehicles[k].coords[1]
-        node_info.append((0, None, None, 'wait', False, self.vehicles[k].coords))
+            # set one-hot
+            node_features[i_nd, one_hot_node_type(t_nd)] = 1
 
-        # Source nodes, one for each vehicle
-        for k_v in self.vehicles:
-            node_features[2*N + 2 + k_v.id, one_hot_node_type('source')] = 1
-            v_pres = None
-            if k_v.coords == [0.0, 0.0] and k_v.free_time < 1440: # if vehicle still at source station
-                v_pres = k_v
-                node_features[2*N + 2 + k_v.id, 12] = 1
-                node_features[2*N + 2 + k_v.id, 13] = k_v.free_capacity
-                node_features[2*N + 2 + k_v.id, 14] = k_v.free_time
-                node_features[2*N + 2 + k_v.id, 15] = T
-                if k == k_v.id:
-                    node_features[2*N + 2 + k_v.id, 16] = 1
-                    next_vehicle_node = 2*N + 2 + k_v.id
-            
-            if v_pres != None: # if not already visited
-                node_info.append((2*N+2+k_v.id, None, v_pres, 'source', k_v.id == k, [0.0, 0.0]))
-        
-        # Create a DGL Graph
-        g = dgl.DGLGraph()
-        g.add_nodes(n_nodes)
-        g.ndata['feat'] = node_features
-        # edges
-        edges = {
-            'src':[],
-            'dst':[],
-            'feat':[]
-        }
-        for (i_u, u, k_u, t_u, u_next, u_coords) in node_info:
-            for (i_v, v, k_v, t_v, v_next, v_coords) in node_info:
-                if is_edge(self, i_u, u, k_u, t_u, u_next, i_v, v, k_v, t_v, v_next):
-                    # Compute edge features
-                    pairing = 1 if (u and u==v) else 0
-                    waiting = 1 if (t_u=='wait' or t_v=='wait') else 0
+            # if pickup or dropoff, store coords and windows
+            if v_user and t_nd=='pickup':
+                # shift the window by current_time if you want
+                w_start, w_end = shift_window(v_user.pickup_window, current_time)
+                node_features[i_nd, 5] = v_user.pickup_coords[0]
+                node_features[i_nd, 6] = v_user.pickup_coords[1]
+                node_features[i_nd, 7] = w_start
+                node_features[i_nd, 8] = w_end
+                node_features[i_nd, 9] = v_user.serve_duration
+                node_features[i_nd, 10] = L - v_user.ride_time
+                node_features[i_nd, 11] = v_user.load
 
-                    feasible = int(self.is_arc_feasible(i_u, i_v))
-                    reverse_feasible = int(self.is_arc_feasible(i_u, i_v))
-                    
-                    # Add to edge list
-                    edges['src'].append(i_u)
-                    edges['dst'].append(i_v)
-                    if self.args.arc_elimination:
-                        edges['feat'].append([euclidean_distance(u_coords, v_coords), pairing, waiting, feasible, reverse_feasible])
-                    else:
-                        edges['feat'].append([euclidean_distance(u_coords, v_coords), pairing, waiting])
+                # check if a vehicle is present
+                if (v_veh := self.vehicle_present(v_user.pickup_coords)):
+                    node_features[i_nd, 12] = 1
+                    node_features[i_nd, 13] = v_veh.free_capacity
+                    node_features[i_nd, 14] = v_veh.free_time
+                    node_features[i_nd, 15] = T
+                    if k == v_veh.id:
+                        node_features[i_nd, 16] = 1
+                        #print(f"Vehicle {k} is at pickup node {i_nd}")
 
-        # Add edges in the graph
-        g.add_edges(edges['src'], edges['dst'], data={'feat':torch.tensor(edges['feat'])})
 
-        # Add laplacian positional encoding information
-        #if self.args.pe_dim:
-        #    transform = dgl.LaplacianPE(k=self.args.pe_dim, feat_name='PE')
-        #    g = transform(g)
+            elif v_user and t_nd=='dropoff':
+                w_start, w_end = shift_window(v_user.dropoff_window, current_time)
+                node_features[i_nd, 5] = v_user.dropoff_coords[0]
+                node_features[i_nd, 6] = v_user.dropoff_coords[1]
+                node_features[i_nd, 7] = w_start
+                node_features[i_nd, 8] = w_end
+                node_features[i_nd, 9] = v_user.serve_duration
+                node_features[i_nd, 10] = L - v_user.ride_time
+                node_features[i_nd, 11] = -v_user.load
 
-        if next_vehicle_node == -1:
-            raise ValueError('No node found for next vehicle')
-        return g, next_vehicle_node
-    
-    # def action2node(self, action):
-    #      """
-    #     given an action, returns the corresponding node in the sate graph
-    #     """
-    #     if action < self.train_N: # user
-    #         if self.users[action].alpha == 0:
-    #             return action+1 # pickup
-    #         else:
-    #             return (action+1) + self.train_N # dropoff
-    #     elif action == self.train_N: # destination
-    #         return 2*action + 1 # 2N + 1
-    #     elif action == self.train_N + 1: # wait
-    #         return torch.tensor(0, device= self.device) 
-    #     else:
-    #         raise RuntimeError('Action not recognized')
+                if (v_veh := self.vehicle_present(v_user.dropoff_coords)):
+                    node_features[i_nd, 12] = 1
+                    node_features[i_nd, 13] = v_veh.free_capacity
+                    node_features[i_nd, 14] = v_veh.free_time
+                    node_features[i_nd, 15] = T
+                    if k == v_veh.id:
+                        node_features[i_nd, 16] = 1
+
+            elif t_nd=='wait':
+                # put the wait node at the vehicle k's coords
+                if k < len(self.vehicles):
+                    node_features[i_nd, 5] = self.vehicles[k].coords[0]
+                    node_features[i_nd, 6] = self.vehicles[k].coords[1]
+
+            elif t_nd=='source' and v_veh is not None:
+                # if vehicle is still at depot, mark it
+                if v_veh.coords == [0.0,0.0] and v_veh.free_time<1440:
+                    node_features[i_nd, 12] = 1
+                    node_features[i_nd, 13] = v_veh.free_capacity
+                    node_features[i_nd, 14] = v_veh.free_time
+                    node_features[i_nd, 15] = T
+                    if k == v_veh.id:
+                        node_features[i_nd, 16] = 1
+
+        self.graph.ndata['feat'] = node_features
+
+    def find_vehicle_node(self, k):
+        """
+        Decide which node index is "occupied" or "controlled" by vehicle k, 
+        to return as next_vehicle_node. 
+        For example, if the vehicle is at a pickup node i, we return i. 
+        If it's at wait=0, we return 0, etc.
+        """
+        # We'll do a simple pass over node_info and see if we set node_features[i,16] = 1
+        # Then that i is the next_vehicle_node.
+
+        node_feats = self.graph.ndata['feat']
+        # The "is next available" bit is index 16
+        print(self.graph.num_nodes())
+        for i_nd in range(self.graph.num_nodes()):
+            if node_feats[i_nd, 16] ==1 :
+                return i_nd
+        # fallback
+        return 0
+
+    def vehicle_present(self, coords):
+        """
+        Return a vehicle if its coords match the given coords (exact or close).
+        """
+        for v in self.vehicles:
+            # watch out for float precision
+            if v.coords == coords:
+                return v
+        return None
+
+
+
     def action2node(self, action):
         """
         Given an action, returns the corresponding node in the state graph as a tensor.
@@ -589,21 +699,34 @@ class Darp:
             raise RuntimeError('Action not recognized')
 
     
+    # def node2action(self, node):
+    #     """
+    #     given an node in the state graph, returns the corresponding action
+    #     """
+    
+    #     if node == 0: # wait
+    #         return torch.tensor(self.train_N + 1, device= self.device)
+    #     elif node <= 2*self.train_N: # user
+    #         return torch.tensor((node - 1) % self.train_N, device=self.device)
+    #     elif node == 2*self.train_N + 1: # destination
+    #         return torch.tensor(self.train_N, device= self.device)
+    #     else:
+    #         print(node)
+    #         raise RuntimeError('Action not recognized')
+    
     def node2action(self, node):
-        """
-        given an node in the state graph, returns the corresponding action
-        """
-    
-        if node == 0: # wait
-            return torch.tensor(self.train_N + 1, device= self.device)
-        elif node <= 2*self.train_N: # user
-            return torch.tensor((node - 1) % self.train_N, device=self.device)
-        elif node == 2*self.train_N + 1: # destination
-            return torch.tensor(self.train_N, device= self.device)
+        if node == 0:  # wait
+            return torch.tensor(self.train_N + 1, device=self.device)
+        elif node <= 2*self.train_N:  # user
+            return torch.tensor((node-1) % self.train_N, device=self.device)
+        elif node == 2*self.train_N + 1:  # destination
+            return torch.tensor(self.train_N, device=self.device)
+        elif node >= 2*self.train_N + 2 and node <= 2*self.train_N + self.train_K + 1:
+            # Source node => treat it as wait or define a new action
+            return torch.tensor(self.train_N + 1, device=self.device)
         else:
-            raise RuntimeError('Action not recognized')
-    
-    
+            raise RuntimeError(f'Action not recognized. Node = {node}')
+
     # noinspection PyMethodMayBeStatic
     def will_pick_up(self, vehicle, user):
         """ Called when a vehicle arrives at a pickup location """
@@ -723,17 +846,11 @@ class Darp:
 
         return travel_time
 
-    def predict(self, graph, vehicle_node_id, user_mask=None, src_mask=None):
-        graph = graph.to(self.device)
+    def predict(self, vehicle_node_id, user_mask=None, src_mask=None):
+        graph =self.graph.to(self.device)
         ks = torch.tensor([vehicle_node_id], device=self.device)
         batch_x = graph.ndata['feat'].to(self.device)
         batch_e = graph.edata['feat'].to(self.device)
-
-        #batch_lap_pe = graph.ndata['PE'].to(self.device)
-        # sign flips
-        #sign_flip = torch.rand(batch_lap_pe.size(1)).to(self.device)
-        #sign_flip[sign_flip>=0.5] = 1.0; sign_flip[sign_flip<0.5] = -1.0
-        #batch_lap_pe = batch_lap_pe * sign_flip.unsqueeze(0)
         
         policy_outputs, value_outputs = self.model(graph, batch_x, batch_e, ks, self.num_nodes,masking=True)  #h_lap_pe=batch_lap_pe
 
@@ -853,6 +970,7 @@ class Darp:
                         print('* The request of User {} is unfinished.'.format(user.id))
         else:
             flag = True
+            self.graph_initialized = False
 
         return flag
 

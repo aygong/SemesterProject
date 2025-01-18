@@ -1,5 +1,5 @@
 from environment import *
-
+from utils import get_device
 
 import os
 import time as t
@@ -7,21 +7,12 @@ from collections import deque
 import copy
 import torch
 
-
 from graph_transformer import GraphTransformerNet
 
 def evaluation(args, model=None):
     # Determine if your system supports CUDA
-
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("Using MPS device.")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-        print("Using CUDA device.")
-    else:
-        device = torch.device("cpu")
-        print("Using CPU device.")
+    cuda_available = torch.cuda.is_available()
+    device = get_device(cuda_available)
 
     darp = Darp(args, mode='evaluate', device=device)
     num_nodes = 2*darp.train_N + darp.train_K + 2
@@ -52,21 +43,16 @@ def evaluation(args, model=None):
         else:
             model = "sl"
             print("Load the model trained by supervised learning.\n")
-        # model = "ppo"
-        #name = './model/ppo-a2-16-7-3-'+str(i)+'.model'
 
         checkpoint = torch.load('./model/' + model + '-' + model_name + '.model', map_location=device)
-        #checkpoint = torch.load(name, map_location=device)
-
-        #print('Load the model from' , name)
         darp.model.load_state_dict(checkpoint['model_state_dict'])
     else:
         darp.model=model
 
     darp.model.eval()
 
-
-    darp.model.cuda()
+    if cuda_available:
+        darp.model.cuda()
 
     path_result = './result/'
 
@@ -236,8 +222,6 @@ def evaluation(args, model=None):
         json.dump(not_same, output)
         output.write('\n')
 
-    return average_dict
-
 
 def greedy_evaluation(darp, num_instance, src_mask=None, logs=True):
     # Run the simulator
@@ -248,17 +232,18 @@ def greedy_evaluation(darp, num_instance, src_mask=None, logs=True):
         time = np.min(free_times)
         indices = np.argwhere(free_times == time)
         indices = indices.flatten().tolist()
+
         for _, k in enumerate(indices):
             if darp.vehicles[k].free_time >= 1440:
                 continue
+            
             darp.beta(k) # Update beta
             state, next_vehicle_node = darp.state_graph(k, time) # Compute state
-            action_node, probs = darp.predict(state, next_vehicle_node, user_mask=None, src_mask=src_mask) # Predict action
+            print('Vehicle {} at node {}.'.format(k, next_vehicle_node))
+            action_node, probs = darp.predict(next_vehicle_node, user_mask=None, src_mask=src_mask) # Predict action
             action = darp.node2action(action_node) # Corresponding node
             darp.log_probs.append(torch.log(probs.squeeze(0)[action]))
             darp.evaluate_step(k, action) # Simulate one step of MDP
-
-
 
     return darp.cost()
 

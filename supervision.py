@@ -22,10 +22,7 @@ def supervision(args, model_load_name=None):
     ### LOAD DATASET ###    
     train_type, train_K, train_N, train_T, train_Q, train_L = load_instance(args.train_index, 'train')
     name = train_type + str(train_K) + '-' + str(train_N)
-    # take only the first 100 datasets
     path_dataset = ['./dataset/' + file for file in os.listdir('./dataset') if file.startswith('dataset-' + name)]
-    # sort by the number of instances
-
     training_sets = []
     for file in path_dataset:
         print('Load', file)
@@ -44,7 +41,7 @@ def supervision(args, model_load_name=None):
 
     ### CREATE TRAIN AND VALIDATION SETS ###
     indices = list(range(data_size))
-    split = int(np.floor(0.02 * data_size))
+    split = int(np.floor(0.2 * data_size))
     train_indices, valid_indices = indices[split:], indices[:split]
     print('The size of training set: {}.'.format(len(train_indices)),
           'The size of validation set: {}.\n'.format(len(valid_indices)))
@@ -79,18 +76,7 @@ def supervision(args, model_load_name=None):
         d_ff=args.d_ff,
         dropout=0.1
     )
-    # print the hyperparameters
-    print('Hyperparameters:')
-    print('d_model:', args.d_model)
-    print('num_layers:', args.num_layers)
-    print('num_heads:', args.num_heads)
-    print('d_k:', args.d_k)
-    print('d_v:', args.d_v)
-    print('d_ff:', args.d_ff)
-    print('dropout:', 0.1)
-    print('pe_dim:', args.pe_dim)
-    print('num_nodes:', num_nodes)
-    print('num_edge_feat:', num_edge_feat)
+    
     model_name = name + '-' + str(args.wait_time) +'-'+ str(args.filename_index)
 
     if cuda_available:
@@ -129,23 +115,13 @@ def supervision(args, model_load_name=None):
 
             iters += 1
             ks = ks.to(device)
-
             action_nodes = action_nodes.to(device)
             values = values.to(device, dtype=torch.float32)
             graphs = graphs.to(device)
             batch_x = graphs.ndata['feat'].to(device)
             batch_e = graphs.edata['feat'].to(device)
 
-            # Laplacian positional encoding
-            #batch_lap_pe = graphs.ndata['PE'].to(device)
-            
-            optimizer.zero_grad()
-            # sign flips
-            #sign_flip = torch.rand(batch_lap_pe.size(1)).to(device)
-            #sign_flip[sign_flip>=0.5] = 1.0; sign_flip[sign_flip<0.5] = -1.0
-            #batch_lap_pe = batch_lap_pe * sign_flip.unsqueeze(0)
-
-            policy_outputs, value_outputs = model(graphs, batch_x, batch_e, ks, num_nodes,  masking=True)#h_lap_pe=batch_lap_pe,
+            policy_outputs, value_outputs = model(graphs, batch_x, batch_e, ks, num_nodes,  masking=True)
             policy_loss = criterion_policy(policy_outputs, action_nodes)
             value_loss = 0#criterion_value(value_outputs / values, torch.ones(values.size()).to(device))
             
@@ -185,7 +161,6 @@ def supervision(args, model_load_name=None):
 
                 # Loop over batches in an epoch using valid_data
                 for _, (graphs, ks, action_nodes, values) in enumerate(valid_data):
-
                     ks = ks.to(device)
                     action_nodes = action_nodes.to(device)
                     values = values.to(device, dtype=torch.float32)
@@ -193,15 +168,7 @@ def supervision(args, model_load_name=None):
                     batch_x = graphs.ndata['feat'].to(device)
                     batch_e = graphs.edata['feat'].to(device)
 
-                    # Laplacian positional encoding
-                    #batch_lap_pe = graphs.ndata['PE'].to(device)
-                    
-                    # sign flips
-                    #sign_flip = torch.rand(batch_lap_pe.size(1)).to(device)
-                    #sign_flip[sign_flip>=0.5] = 1.0; sign_flip[sign_flip<0.5] = -1.0
-                    #batch_lap_pe = batch_lap_pe * sign_flip.unsqueeze(0)
-
-                    policy_outputs, value_outputs = model(graphs, batch_x, batch_e, ks, num_nodes,  masking=True) #h_lap_pe=batch_lap_pe,
+                    policy_outputs, value_outputs = model(graphs, batch_x, batch_e, ks, num_nodes, masking=True)
                     policy_loss = criterion_policy(policy_outputs, action_nodes)
                     value_loss = 0#criterion_value(value_outputs / values, torch.ones(values.size()).to(device))
                     loss =  policy_loss + value_loss * args.loss_ratio
@@ -223,7 +190,7 @@ def supervision(args, model_load_name=None):
             'scheduler_state_dict': scheduler.state_dict(),
             'policy_loss': criterion_policy#,
             #'value_loss': criterion_value,
-        }, './model/' + 'sl-' + model_name  + '.model')
+        }, './model/' + 'sl-' + model_name + '.model')
 
         end = time.time()
         exec_time = end - start
@@ -253,3 +220,4 @@ def supervision(args, model_load_name=None):
         valid_policy_performance = valid_policy_performance,
         valid_value_performance = valid_value_performance
         )
+

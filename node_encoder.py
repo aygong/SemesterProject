@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 import torch.nn.functional as f
-import time
 
 
 class Head(nn.Module):
@@ -206,12 +205,8 @@ class NodeEncoder(nn.Module):
         node_seq.append(self.linear_routedur(nodes[:,13:14]))
         node_seq.append(self.embed_isnext(nodes[:,14].long()))
 
-        #for n in node_seq:
-        #    print(n.size())
-
         x = torch.stack(node_seq, dim=1)
         x = self.node_encoder(x)
-        #print(x.flatten(start_dim=2).size())
         x = self.node_linear(x.flatten(start_dim=1))
 
         return x
